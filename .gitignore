@@ -1,0 +1,10 @@
+*.out
+*.err
+*.bgz
+*.tbi
+*.jar
+*.gz
+**/.cache/
+./variant_utils-main/gnomad_all_genes/
+./logs/
+./gatk-4.6.1.0/
