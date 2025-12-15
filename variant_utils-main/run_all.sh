@@ -44,7 +44,12 @@ mkdir -p "$WORKDIR"
 echo "Staging to scratch: $WORKDIR"
 rsync -a --delete "$SOURCE_DIR"/ "$WORKDIR"/
 cd "$WORKDIR"
-PROJ_DIR="$WORKDIR/variant_utils-main"
+# Determine project directory (works whether submitted from repo root or within subdir)
+if [ -d "$WORKDIR/variant_utils-main" ]; then
+    PROJ_DIR="$WORKDIR/variant_utils-main"
+else
+    PROJ_DIR="$WORKDIR"
+fi
 
 # Optionally rewrite external_tools.json to point to staged copies (default: skip).
 # Set REWRITE_EXTERNAL=1 only if gatk/picard/gnomAD/spliceAI are present under the staged tree.
@@ -52,11 +57,12 @@ REWRITE_EXTERNAL="${REWRITE_EXTERNAL:-0}"
 if [ "$REWRITE_EXTERNAL" -eq 1 ]; then
 python - <<'PY'
 import json, os, pathlib
-cfg_path = pathlib.Path("variant_utils-main/external_tools.json")
+proj_dir = pathlib.Path(os.environ["PROJ_DIR"])
+cfg_path = proj_dir / "external_tools.json"
 with cfg_path.open() as f:
     cfg = json.load(f)
 java_path = pathlib.Path(os.path.expanduser(cfg.get("java", "")))
-base = pathlib.Path(os.getcwd())
+base = proj_dir
 v4_root = base / "data" / "dbs" / "gnomad" / "release" / "v4.1.0"
 v2_root = base / "data" / "dbs" / "gnomad" / "release" / "v2.1.1"
 splice_root = base / "data" / "dbs" / "spliceAI"
@@ -245,9 +251,9 @@ echo "==========================================================================
 # Sync results back to submit directory
 if [ -n "$SLURM_SUBMIT_DIR" ]; then
     echo "Syncing results back to $SLURM_SUBMIT_DIR"
-    rsync -a "$PROJ_DIR/gnomad_all_genes"/ "$SLURM_SUBMIT_DIR/variant_utils-main/gnomad_all_genes"/ 2>/dev/null
-    rsync -a "$PROJ_DIR/gnomad_all_genes_validated"/ "$SLURM_SUBMIT_DIR/variant_utils-main/gnomad_all_genes_validated"/ 2>/dev/null
-    rsync -a "$PROJ_DIR/logs"/ "$SLURM_SUBMIT_DIR/variant_utils-main/logs"/ 2>/dev/null
+    rsync -a "$PROJ_DIR/gnomad_all_genes"/ "$SLURM_SUBMIT_DIR/gnomad_all_genes"/ 2>/dev/null
+    rsync -a "$PROJ_DIR/gnomad_all_genes_validated"/ "$SLURM_SUBMIT_DIR/gnomad_all_genes_validated"/ 2>/dev/null
+    rsync -a "$PROJ_DIR/logs"/ "$SLURM_SUBMIT_DIR/logs"/ 2>/dev/null
 fi
 
 exit 0
