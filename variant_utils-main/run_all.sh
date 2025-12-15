@@ -3,7 +3,7 @@
 #SBATCH --partition=model4          # 64 CPUs, ~192GB RAM, fast scratch
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=48          # leave headroom below 64 for GC/IO
+#SBATCH --cpus-per-task=32          # leave headroom below 64 for GC/IO
 #SBATCH --mem=170GB                 # below the ~192GB node cap for safety
 #SBATCH --time=24:00:00
 #SBATCH --output=./logs/fetch_missense_%j.out
@@ -87,7 +87,7 @@ fi
 
 # Allow overriding parallelism and temp location without editing the script
 CHROM_WORKERS="${CHROM_WORKERS:-1}"   # chromosome-level parallelism (memory-heavy)
-GENE_WORKERS="${GENE_WORKERS:-40}"    # gene-level parallelism (CPU/I/O-bound); sized for 48 CPUs
+GENE_WORKERS="${GENE_WORKERS:-24}"    # gene-level parallelism (CPU/I/O-bound); sized for 48 CPUs
 export TMPDIR="${TMPDIR:-$PROJ_DIR/gnomad_all_genes/tmp}"
 
 echo "============================================================================"
