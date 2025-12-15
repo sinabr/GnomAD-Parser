@@ -63,8 +63,8 @@ with cfg_path.open() as f:
     cfg = json.load(f)
 java_path = pathlib.Path(os.path.expanduser(cfg.get("java", "")))
 base = proj_dir
-v4_root = base / "data" / "dbs" / "gnomad" / "release" / "v4.1.0"
-v2_root = base / "data" / "dbs" / "gnomad" / "release" / "v2.1.1"
+v4_root = base / "data"
+v2_root = base / "data"
 splice_root = base / "data" / "dbs" / "spliceAI"
 if not v4_root.exists() or not v2_root.exists():
     print("Scratch VCF roots missing; keeping external_tools.json unchanged.")
