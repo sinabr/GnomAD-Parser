@@ -23,6 +23,8 @@ def querySpliceAI(assembly:str, chrom:str, position_min:int, position_max:int,ex
     
     """
     external_tools = read_external_config(external_config_filepath)
+    gatk_path = external_tools.get("gatk")
+    assert gatk_path, "gatk path missing from external_tools configuration"
     spliceAIRoot = Path(external_tools.get("spliceAIRoot"))
     if assembly == 'GRCh38':
         spliceAI_filepath = spliceAIRoot / "spliceai_scores.raw.snv.hg38.vcf.gz"
@@ -32,8 +34,17 @@ def querySpliceAI(assembly:str, chrom:str, position_min:int, position_max:int,ex
     write_dir = Path(kwargs.get('write_dir',"/tmp"))
     write_dir.mkdir(exist_ok=True)
     output_filepath = write_dir / f'splice_ai_query_result.{str(datetime.now()).replace(" ","_")}.vcf'
-    cmd = f"gatk SelectVariants -V {spliceAI_filepath} -L {chrom}:{max(position_min,1)}-{position_max} --output {output_filepath}"
-    subprocess.run(cmd.split(" "))
+    cmd = [
+        str(gatk_path),
+        "SelectVariants",
+        "-V",
+        str(spliceAI_filepath),
+        "-L",
+        f"{chrom}:{max(position_min,1)}-{position_max}",
+        "--output",
+        str(output_filepath),
+    ]
+    subprocess.run(cmd, check=True)
     result_df = pd.read_csv(output_filepath,comment='#',delimiter='\t',header=None,
                     names='CHROM POS ID REF ALT QUAL FILTER INFO'.split(" "),
                         dtype={k : str for k in 'CHROM POS REF ALT'.split(" ")})

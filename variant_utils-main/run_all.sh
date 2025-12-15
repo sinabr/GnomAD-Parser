@@ -71,7 +71,7 @@ if not v4_root.exists() or not v2_root.exists():
     raise SystemExit(0)
 new_cfg = {
     "java": str(java_path),
-    "gatk": str(base / "gatk-4.4.0.0" / "gatk"),
+    "gatk": str(base / "gatk-4.6.1.0" / "gatk"),
     "picard_filepath": str(base / "picard.jar"),
     "gnomad_v4_vcf_root": str(v4_root),
     "gnomad_v2_vcf_root": str(v2_root),
