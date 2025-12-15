@@ -1,0 +1,8 @@
+{
+    "java" : "~/software/jdk-21",
+    "gatk" : "/projects/lugoteam/protein_graphs/GnomAD-Parser/gatk-4.4.0.0/gatk",
+    "picard_filepath": "/projects/lugoteam/protein_graphs/GnomAD-Parser/picard.jar",
+    "gnomad_v4_vcf_root": "/projects/lugoteam/protein_graphs/GnomAD-Parser/data/dbs/gnomad/release/v4.1.0/",
+    "gnomad_v2_vcf_root": "/projects/lugoteam/protein_graphs/GnomAD-Parser/data/dbs/gnomad/release/v2.1.1/",
+    "spliceAIRoot" : "/projects/lugoteam/protein_graphs/GnomAD-Parser/data/dbs/spliceAI/"
+}

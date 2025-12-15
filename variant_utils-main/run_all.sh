@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=gnomad_chrom_batch
-#SBATCH --partition=RM
+#SBATCH --partition=model4          # 64 CPUs, ~192GB RAM, fast scratch
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128
-#SBATCH --mem=200GB
-#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=48          # leave headroom below 64 for GC/IO
+#SBATCH --mem=170GB                 # below the ~192GB node cap for safety
+#SBATCH --time=24:00:00
 #SBATCH --output=./logs/fetch_missense_%j.out
 #SBATCH --error=./logs/fetch_missense_%j.err
 
@@ -36,6 +36,54 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate protein
 
+# Stage to fast scratch
+SOURCE_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+SCRATCH_ROOT="/scratch/barazand"
+WORKDIR="${SCRATCH_ROOT}/gnomad_run_${SLURM_JOB_ID:-manual}"
+mkdir -p "$WORKDIR"
+echo "Staging to scratch: $WORKDIR"
+rsync -a --delete "$SOURCE_DIR"/ "$WORKDIR"/
+cd "$WORKDIR"
+PROJ_DIR="$WORKDIR/variant_utils-main"
+
+# Optionally rewrite external_tools.json to point to staged copies (default: skip).
+# Set REWRITE_EXTERNAL=1 only if gatk/picard/gnomAD/spliceAI are present under the staged tree.
+REWRITE_EXTERNAL="${REWRITE_EXTERNAL:-0}"
+if [ "$REWRITE_EXTERNAL" -eq 1 ]; then
+python - <<'PY'
+import json, os, pathlib
+cfg_path = pathlib.Path("variant_utils-main/external_tools.json")
+with cfg_path.open() as f:
+    cfg = json.load(f)
+java_path = pathlib.Path(os.path.expanduser(cfg.get("java", "")))
+base = pathlib.Path(os.getcwd())
+v4_root = base / "data" / "dbs" / "gnomad" / "release" / "v4.1.0"
+v2_root = base / "data" / "dbs" / "gnomad" / "release" / "v2.1.1"
+splice_root = base / "data" / "dbs" / "spliceAI"
+if not v4_root.exists() or not v2_root.exists():
+    print("Scratch VCF roots missing; keeping external_tools.json unchanged.")
+    raise SystemExit(0)
+new_cfg = {
+    "java": str(java_path),
+    "gatk": str(base / "gatk-4.4.0.0" / "gatk"),
+    "picard_filepath": str(base / "picard.jar"),
+    "gnomad_v4_vcf_root": str(v4_root),
+    "gnomad_v2_vcf_root": str(v2_root),
+    "spliceAIRoot": str(splice_root)
+}
+cfg_path.write_text(json.dumps(new_cfg, indent=4))
+print("external_tools.json rewritten for scratch staging:")
+print(json.dumps(new_cfg, indent=2))
+PY
+else
+    echo "Using external_tools.json paths as-is (cluster absolute paths expected)."
+fi
+
+# Allow overriding parallelism and temp location without editing the script
+CHROM_WORKERS="${CHROM_WORKERS:-1}"   # chromosome-level parallelism (memory-heavy)
+GENE_WORKERS="${GENE_WORKERS:-40}"    # gene-level parallelism (CPU/I/O-bound); sized for 48 CPUs
+export TMPDIR="${TMPDIR:-$PROJ_DIR/gnomad_all_genes/tmp}"
+
 echo "============================================================================"
 echo "JOB INFORMATION"
 echo "============================================================================"
@@ -43,13 +91,16 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Job Name: $SLURM_JOB_NAME"
 echo "Node: $SLURM_NODELIST"
 echo "CPUs: $SLURM_CPUS_PER_TASK"
-echo "Memory: 32GB"
+echo "Memory: $SLURM_MEM_PER_NODE"
 echo "Start Time: $(date)"
 echo "Strategy: Chromosome-batched processing"
+echo "Chromosome workers: $CHROM_WORKERS"
+echo "Gene workers: $GENE_WORKERS"
+echo "TMPDIR: $TMPDIR"
 echo "============================================================================"
 
 # Load modules
-export JAVA_HOME=/jet/home/barazand/NEWOCEAN/java/jdk-21.0.9
+export JAVA_HOME=$HOME/software/jdk-21
 export PATH=$JAVA_HOME/bin:$PATH
 
 echo ""
@@ -59,20 +110,16 @@ echo ""
 
 # Set thread limits for GATK
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
-export JAVA_OPTS="-Xmx28g -XX:+UseParallelGC -XX:ParallelGCThreads=2"
+export JAVA_OPTS="-Xmx96g -XX:+UseParallelGC -XX:ParallelGCThreads=4"
 
 echo "Environment configured:"
 echo "  OMP_NUM_THREADS: $OMP_NUM_THREADS"
 echo "  JAVA_OPTS: $JAVA_OPTS"
 echo ""
 
-# Navigate to working directory
-cd $SLURM_SUBMIT_DIR
-echo "Working directory: $(pwd)"
-echo ""
-
 # Create logs directory if it doesn't exist
-mkdir -p logs
+mkdir -p "$PROJ_DIR/logs"
+mkdir -p "$TMPDIR"
 
 # ============================================================================
 # STEP 1: FETCH GNOMAD DATA (CHROMOSOME-BATCHED)
@@ -85,16 +132,16 @@ echo ""
 echo "Strategy:"
 echo "  - Process ONE chromosome at a time (reduces memory)"
 echo "  - Extract chromosome VCF once, use for ALL genes on that chromosome"
-echo "  - Process 4 genes in parallel per chromosome"
+echo "  - Process multiple genes in parallel per chromosome"
 echo "  - Full checkpointing and resume capability"
 echo ""
 echo "Start time: $(date)"
 echo ""
 
-# Run with optimized settings
-python /jet/home/barazand/NEWOCEAN/proteins/gnomAD/variant_utils-main/download_all_gnomad_parallel.py \
-    --chrom-workers 2 \
-    --gene-workers 32
+# Run with optimized settings (scratch copy)
+(cd "$PROJ_DIR" && python download_all_gnomad_parallel.py \
+    --chrom-workers "$CHROM_WORKERS" \
+    --gene-workers "$GENE_WORKERS")
 
 STEP1_EXIT=$?
 
@@ -120,7 +167,7 @@ echo "==========================================================================
 echo "Start time: $(date)"
 echo ""
 
-python /jet/home/barazand/NEWOCEAN/proteins/gnomAD/variant_utils-main/validate_all_missenses.py
+(cd "$PROJ_DIR" && python validate_all_missenses.py)
 
 STEP2_EXIT=$?
 
@@ -194,5 +241,13 @@ echo ""
 echo "NOTE: Chromosome VCF cache is preserved for future runs."
 echo "      To clear cache: rm -rf gnomad_all_genes/chromosome_cache"
 echo "============================================================================"
+
+# Sync results back to submit directory
+if [ -n "$SLURM_SUBMIT_DIR" ]; then
+    echo "Syncing results back to $SLURM_SUBMIT_DIR"
+    rsync -a "$PROJ_DIR/gnomad_all_genes"/ "$SLURM_SUBMIT_DIR/variant_utils-main/gnomad_all_genes"/ 2>/dev/null
+    rsync -a "$PROJ_DIR/gnomad_all_genes_validated"/ "$SLURM_SUBMIT_DIR/variant_utils-main/gnomad_all_genes_validated"/ 2>/dev/null
+    rsync -a "$PROJ_DIR/logs"/ "$SLURM_SUBMIT_DIR/variant_utils-main/logs"/ 2>/dev/null
+fi
 
 exit 0
