@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 # Paths
-REFERENCE_DIR = Path("/jet/home/barazand/NEWOCEAN/ref_data")
+REFERENCE_DIR = Path("/projects/lugoteam/protein_graphs/GnomAD-Parser/ref_data")
 MANE_SUMMARY = REFERENCE_DIR / "mane" / "MANE.GRCh38.v1.3.summary.txt.gz"
 EXTERNAL_TOOLS_CONFIG = "external_tools.json"
 
