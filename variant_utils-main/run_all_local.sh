@@ -4,10 +4,14 @@
 
 set -euo pipefail
 
-# Activate environment (adjust if your conda is elsewhere)
+# Activate environment (adjust if your conda is elsewhere). Temporarily disable
+# nounset to avoid issues in conda activate/deactivate scripts that expect
+# unset backup vars.
 if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    set +u
     source "$HOME/miniconda3/etc/profile.d/conda.sh"
     conda activate protein
+    set -u
 fi
 
 # Resolve project directory (this script lives in variant_utils-main/)
