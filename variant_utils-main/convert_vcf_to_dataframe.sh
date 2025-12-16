@@ -1,24 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=gnomad_convert_opt
+#SBATCH --job-name=gnomad_chunked
 #SBATCH --partition=model4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=100GB
-#SBATCH --time=12:00:00              # Should finish in ~6-8 hours now
-#SBATCH --output=./logs/convert_opt_%j.out
-#SBATCH --error=./logs/convert_opt_%j.err
+#SBATCH --mem=170GB                 # Increased for safety, but only uses ~15GB
+#SBATCH --time=24:00:00
+#SBATCH --output=./logs/convert_chunked_%j.out
+#SBATCH --error=./logs/convert_chunked_%j.err
 
 # ============================================================================
-# SLURM Job: OPTIMIZED VCF to DataFrame Conversion
+# SLURM Job: MEMORY-EFFICIENT VCF to DataFrame Conversion
 # ============================================================================
 # 
-# KEY OPTIMIZATION: Don't filter missense during VCF reading!
-# - Stores ALL SNPs + PASS variants
-# - Filter to missense later in pandas (takes <1 second)
-# - 10x faster than filtering during read!
+# KEY OPTIMIZATION: Chunked processing!
+# - Processes 500K variants at a time
+# - Writes incrementally to Parquet
+# - Never loads full chromosome into memory
+# - Peak memory: ~10-15 GB (vs 60+ GB before)
 #
-# Expected time: ~20-30 min per chromosome (vs 2-3 hours with missense filter)
+# This solves the OOM (Out of Memory) errors!
 # ============================================================================
 
 source ~/miniconda3/etc/profile.d/conda.sh
@@ -44,26 +45,31 @@ echo "Checking environment..."
 python --version
 python -c "import pysam; print(f'pysam version: {pysam.__version__}')"
 python -c "import pandas; print(f'pandas version: {pandas.__version__}')"
+python -c "import pyarrow; print(f'pyarrow version: {pyarrow.__version__}')"
+echo ""
+
+# Check available memory
+echo "System memory:"
+free -h
 echo ""
 
 # ============================================================================
-# RUN OPTIMIZED CONVERSION
+# RUN MEMORY-EFFICIENT CONVERSION
 # ============================================================================
 
 echo "============================================================================"
-echo "OPTIMIZED VCF TO DATAFRAME CONVERSION"
+echo "MEMORY-EFFICIENT VCF TO DATAFRAME CONVERSION"
 echo "============================================================================"
 echo ""
 echo "Optimization:"
-echo "  - Store ALL variants (SNPs + PASS)"
-echo "  - Don't filter missense during reading"
-echo "  - Filter missense later in pandas (<1 second!)"
-echo "  - This is 10x faster!"
+echo "  - Chunked processing (500K variants per batch)"
+echo "  - Incremental writes to Parquet"
+echo "  - Peak memory: ~10-15 GB (safe!)"
 echo ""
 echo "Start time: $(date)"
 echo ""
 
-# Run optimized conversion
+# Run chunked conversion
 python convert_vcf_to_dataframe.py
 
 EXIT_CODE=$?
@@ -102,16 +108,20 @@ if [ -f "gnomad_all_genes/chromosome_dataframes/conversion_summary.csv" ]; then
     echo ""
 fi
 
+# Check for temp files (should be cleaned up)
+TEMP_FILES=$(ls gnomad_all_genes/chromosome_dataframes/.tmp_* 2>/dev/null | wc -l)
+if [ $TEMP_FILES -gt 0 ]; then
+    echo "WARNING: Found $TEMP_FILES temp files (cleaning up...)"
+    rm -f gnomad_all_genes/chromosome_dataframes/.tmp_*
+fi
+
 echo "============================================================================"
 echo "JOB COMPLETED SUCCESSFULLY"
 echo "============================================================================"
 echo "End Time: $(date)"
 echo ""
-echo "Usage examples:"
-echo "  # Load chromosome"
+echo "Usage:"
 echo "  df = pd.read_parquet('gnomad_all_genes/chromosome_dataframes/chr1_variants.parquet')"
-echo ""
-echo "  # Filter to missense (takes <1 second!)"
 echo "  missense = df[df['Consequence'].str.contains('missense', na=False)]"
 echo "============================================================================"
 

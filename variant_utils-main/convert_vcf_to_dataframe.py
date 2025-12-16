@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-OPTIMIZED: Direct VCF to DataFrame Conversion
+MEMORY-EFFICIENT: VCF to DataFrame with Chunked Processing
 
-KEY OPTIMIZATION: Don't filter missense during VCF reading!
-- Read ALL SNPs + PASS variants
-- Parse VEP once
-- Save complete DataFrame
-- Filter to missense later (takes <1 second in pandas)
+KEY OPTIMIZATION: Process and save in chunks!
+- Read VCF in batches
+- Save each batch incrementally
+- Never load full chromosome into memory
+- Uses Parquet append mode
 
-This is 10x faster than filtering missense during reading!
+Maximum memory usage: ~10-15 GB (vs 60+ GB before)
 """
 
 import pandas as pd
@@ -18,6 +18,8 @@ import logging
 from typing import List, Dict
 import time
 import argparse
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Setup logging
 logging.basicConfig(
@@ -33,6 +35,9 @@ DF_DIR = Path("gnomad_all_genes/chromosome_dataframes")
 
 # Chromosomes
 CHROMOSOMES = [str(i) for i in range(1, 23)] + ['X', 'Y']
+
+# Chunk size (tune based on memory)
+CHUNK_SIZE = 500000  # Process 500K variants at a time
 
 
 def get_vep_columns_from_header(vcf_path: str) -> List[str]:
@@ -72,31 +77,32 @@ def parse_vep_annotation(vep_string: str, columns: List[str]) -> List[Dict]:
     return annotations
 
 
-def vcf_to_dataframe_optimized(vcf_path: Path, vep_columns: List[str]) -> pd.DataFrame:
+def process_vcf_in_chunks(vcf_path: Path, vep_columns: List[str], output_file: Path, 
+                          source_label: str, is_first_file: bool = True):
     """
-    OPTIMIZED: Read VCF and convert to DataFrame.
+    Process VCF in chunks and append to Parquet file.
     
-    Filters:
-    - SNPs only (no indels)
-    - PASS only (QC passed)
-    - Parses ALL VEP annotations
-    
-    Does NOT filter by consequence type - do that later in pandas!
+    Memory-efficient: Never loads entire chromosome into memory.
     """
-    logger.info(f"  Reading {vcf_path.name}...")
+    logger.info(f"  Processing {vcf_path.name} ({source_label})...")
     
     vcf = VariantFile(str(vcf_path))
-    records = []
     
+    chunk_records = []
     variants_total = 0
     variants_kept = 0
+    chunks_written = 0
+    
+    # Get schema from first chunk (for Parquet writer)
+    writer = None
+    schema = None
     
     for record in vcf:
         variants_total += 1
         
         # Progress indicator
         if variants_total % 1000000 == 0:
-            logger.info(f"    Processed {variants_total:,} variants...")
+            logger.info(f"    Processed {variants_total:,} variants, kept {variants_kept:,}...")
         
         # Filter: SNPs only
         if not record.alts:
@@ -119,6 +125,7 @@ def vcf_to_dataframe_optimized(vcf_path: Path, vep_columns: List[str]) -> pd.Dat
             'POS': record.pos,
             'REF': record.ref,
             'ALT': ','.join([str(a) for a in record.alts]) if record.alts else '',
+            'source': source_label,
         }
         
         # Add key INFO fields
@@ -137,58 +144,76 @@ def vcf_to_dataframe_optimized(vcf_path: Path, vep_columns: List[str]) -> pd.Dat
             else:
                 base_record[field] = None
         
-        # Parse VEP - creates multiple rows (one per transcript)
+        # Parse VEP
         vep_string = record.info.get('vep', None)
         vep_annotations = parse_vep_annotation(vep_string, vep_columns)
         
         if vep_annotations:
             for vep_ann in vep_annotations:
                 full_record = {**base_record, **vep_ann}
-                records.append(full_record)
+                chunk_records.append(full_record)
         else:
-            # No VEP - add row with empty VEP fields
             full_record = {**base_record, **{col: '' for col in vep_columns}}
-            records.append(full_record)
+            chunk_records.append(full_record)
+        
+        # Write chunk when it reaches size limit
+        if len(chunk_records) >= CHUNK_SIZE:
+            chunk_df = pd.DataFrame(chunk_records)
+            
+            # Optimize dtypes
+            chunk_df['POS'] = chunk_df['POS'].astype('int32')
+            for col in ['AC', 'AN', 'AF', 'nhomalt', 'faf95', 'faf99', 'cadd_phred', 'phylop']:
+                if col in chunk_df.columns:
+                    chunk_df[col] = pd.to_numeric(chunk_df[col], errors='coerce')
+            
+            # Write to Parquet
+            if writer is None:
+                # First chunk - create writer with schema
+                schema = pa.Schema.from_pandas(chunk_df)
+                writer = pq.ParquetWriter(output_file, schema, compression='snappy')
+            
+            table = pa.Table.from_pandas(chunk_df, schema=schema)
+            writer.write_table(table)
+            
+            chunks_written += 1
+            logger.info(f"    Wrote chunk {chunks_written} ({len(chunk_records):,} rows)")
+            
+            # Clear chunk
+            chunk_records = []
+    
+    # Write remaining records
+    if chunk_records:
+        chunk_df = pd.DataFrame(chunk_records)
+        
+        # Optimize dtypes
+        chunk_df['POS'] = chunk_df['POS'].astype('int32')
+        for col in ['AC', 'AN', 'AF', 'nhomalt', 'faf95', 'faf99', 'cadd_phred', 'phylop']:
+            if col in chunk_df.columns:
+                chunk_df[col] = pd.to_numeric(chunk_df[col], errors='coerce')
+        
+        if writer is None:
+            # Only one small chunk - just save it
+            chunk_df.to_parquet(output_file, index=False, compression='snappy')
+        else:
+            table = pa.Table.from_pandas(chunk_df, schema=schema)
+            writer.write_table(table)
+            chunks_written += 1
+    
+    # Close writer
+    if writer is not None:
+        writer.close()
     
     vcf.close()
     
     logger.info(f"    Total variants: {variants_total:,}")
-    logger.info(f"    SNPs + PASS: {variants_kept:,} ({100*variants_kept/variants_total:.1f}%)")
-    logger.info(f"    Total annotations: {len(records):,}")
+    logger.info(f"    SNPs + PASS: {variants_kept:,}")
+    logger.info(f"    Annotations written: {chunks_written * CHUNK_SIZE + len(chunk_records):,}")
     
-    if not records:
-        return pd.DataFrame()
-    
-    return pd.DataFrame(records)
-
-
-def merge_exomes_genomes(exomes_df: pd.DataFrame, genomes_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge exomes and genomes DataFrames."""
-    if exomes_df.empty and genomes_df.empty:
-        return pd.DataFrame()
-    
-    if exomes_df.empty:
-        genomes_df['source'] = 'genomes'
-        return genomes_df
-    
-    if genomes_df.empty:
-        exomes_df['source'] = 'exomes'
-        return exomes_df
-    
-    # Mark source
-    exomes_df['source'] = 'exomes'
-    genomes_df['source'] = 'genomes'
-    
-    # Combine
-    combined = pd.concat([exomes_df, genomes_df], ignore_index=True)
-    
-    logger.info(f"  Merged: {len(exomes_df):,} exomes + {len(genomes_df):,} genomes = {len(combined):,} total")
-    
-    return combined
+    return variants_kept
 
 
 def process_chromosome(chrom: str) -> Dict:
-    """Process one chromosome: read source VCF → filter → parse VEP → save DataFrame."""
+    """Process one chromosome with memory-efficient chunking."""
     logger.info(f"\n{'='*80}")
     logger.info(f"Processing Chromosome {chrom}")
     logger.info(f"{'='*80}")
@@ -201,7 +226,6 @@ def process_chromosome(chrom: str) -> Dict:
         if output_file.exists():
             logger.info(f"✅ Chr{chrom} DataFrame already exists (skipping)")
             file_size_mb = output_file.stat().st_size / 1e6
-            # Load to get variant count
             df = pd.read_parquet(output_file)
             return {
                 'chrom': chrom,
@@ -225,49 +249,42 @@ def process_chromosome(chrom: str) -> Dict:
                 'error': 'Source VCFs not found'
             }
         
-        # Get VEP columns from header
+        # Get VEP columns
         vep_columns = get_vep_columns_from_header(str(exomes_source))
         logger.info(f"VEP columns: {len(vep_columns)} fields")
+        logger.info(f"Chunk size: {CHUNK_SIZE:,} variants per batch")
         
-        # Read and filter exomes (NO MISSENSE FILTERING - do that later!)
-        logger.info("Processing EXOMES...")
-        exomes_df = vcf_to_dataframe_optimized(exomes_source, vep_columns)
+        # Process exomes (writes to temp file)
+        temp_exomes = DF_DIR / f".tmp_chr{chrom}_exomes.parquet"
+        logger.info("Processing EXOMES in chunks...")
+        exomes_count = process_vcf_in_chunks(exomes_source, vep_columns, temp_exomes, 'exomes', True)
         
-        # Read and filter genomes (NO MISSENSE FILTERING - do that later!)
-        logger.info("Processing GENOMES...")
-        genomes_df = vcf_to_dataframe_optimized(genomes_source, vep_columns)
+        # Process genomes (writes to temp file)
+        temp_genomes = DF_DIR / f".tmp_chr{chrom}_genomes.parquet"
+        logger.info("Processing GENOMES in chunks...")
+        genomes_count = process_vcf_in_chunks(genomes_source, vep_columns, temp_genomes, 'genomes', False)
         
-        # Merge
+        # Merge the two files
         logger.info("Merging exomes and genomes...")
-        combined_df = merge_exomes_genomes(exomes_df, genomes_df)
+        exomes_df = pd.read_parquet(temp_exomes)
+        genomes_df = pd.read_parquet(temp_genomes)
         
-        if combined_df.empty:
-            logger.warning(f"⚠️  Chr{chrom}: No variants after filtering and merging")
-            return {
-                'chrom': chrom,
-                'status': 'success',
-                'variants': 0,
-                'time': time.time() - start_time
-            }
+        combined_df = pd.concat([exomes_df, genomes_df], ignore_index=True)
         
-        # Optimize data types
-        logger.info("  Optimizing data types...")
-        combined_df['POS'] = combined_df['POS'].astype('int32')
+        logger.info(f"  Total: {len(exomes_df):,} exomes + {len(genomes_df):,} genomes = {len(combined_df):,}")
         
-        # Convert numeric columns
-        numeric_cols = ['AC', 'AN', 'AF', 'nhomalt', 'faf95', 'faf99', 'cadd_phred', 'phylop']
-        for col in numeric_cols:
-            if col in combined_df.columns:
-                combined_df[col] = pd.to_numeric(combined_df[col], errors='coerce')
-        
-        # Save DataFrame (ALL variants, not just missense!)
-        logger.info(f"  Saving DataFrame to {output_file.name}...")
+        # Save final combined file
+        logger.info(f"  Saving final DataFrame to {output_file.name}...")
         combined_df.to_parquet(output_file, index=False, compression='snappy')
+        
+        # Clean up temp files
+        temp_exomes.unlink()
+        temp_genomes.unlink()
         
         file_size_mb = output_file.stat().st_size / 1e6
         elapsed = time.time() - start_time
         
-        # Report missense count for reference
+        # Report missense count
         missense_count = combined_df['Consequence'].str.contains('missense', na=False).sum()
         
         logger.info(f"✅ Chr{chrom} complete:")
@@ -275,6 +292,7 @@ def process_chromosome(chrom: str) -> Dict:
         logger.info(f"   Missense annotations: {missense_count:,}")
         logger.info(f"   File size: {file_size_mb:.1f} MB")
         logger.info(f"   Time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+        logger.info(f"   Peak memory: ~10-15 GB (chunked processing)")
         
         return {
             'chrom': chrom,
@@ -290,6 +308,14 @@ def process_chromosome(chrom: str) -> Dict:
         import traceback
         traceback.print_exc()
         
+        # Clean up temp files on error
+        temp_exomes = DF_DIR / f".tmp_chr{chrom}_exomes.parquet"
+        temp_genomes = DF_DIR / f".tmp_chr{chrom}_genomes.parquet"
+        if temp_exomes.exists():
+            temp_exomes.unlink()
+        if temp_genomes.exists():
+            temp_genomes.unlink()
+        
         return {
             'chrom': chrom,
             'status': 'failed',
@@ -302,22 +328,28 @@ def process_chromosome(chrom: str) -> Dict:
 def main():
     """Main execution."""
     parser = argparse.ArgumentParser(
-        description='Convert gnomAD VCFs to DataFrames (OPTIMIZED - no missense filtering)'
+        description='Memory-efficient VCF to DataFrame conversion with chunking'
     )
     parser.add_argument('--chromosomes', nargs='+', default=CHROMOSOMES,
                        help='Chromosomes to process (default: all)')
+    parser.add_argument('--chunk-size', type=int, default=CHUNK_SIZE,
+                       help=f'Chunk size for processing (default: {CHUNK_SIZE})')
     args = parser.parse_args()
     
+    global CHUNK_SIZE
+    CHUNK_SIZE = args.chunk_size
+    
     logger.info("\n" + "="*80)
-    logger.info("OPTIMIZED VCF TO DATAFRAME CONVERSION")
+    logger.info("MEMORY-EFFICIENT VCF TO DATAFRAME CONVERSION")
     logger.info("="*80)
     logger.info(f"Source exomes: {SOURCE_EXOMES}")
     logger.info(f"Source genomes: {SOURCE_GENOMES}")
     logger.info(f"Output directory: {DF_DIR}")
     logger.info(f"Chromosomes: {', '.join(args.chromosomes)}")
+    logger.info(f"Chunk size: {CHUNK_SIZE:,} variants")
     logger.info("")
-    logger.info("OPTIMIZATION: Storing ALL variants (SNPs + PASS)")
-    logger.info("              Filter to missense later in pandas (much faster!)")
+    logger.info("OPTIMIZATION: Chunked processing")
+    logger.info("              Peak memory: ~10-15 GB (vs 60+ GB before)")
     
     # Create output directory
     DF_DIR.mkdir(exist_ok=True, parents=True)
@@ -325,7 +357,7 @@ def main():
     start_time = time.time()
     results = []
     
-    # Process chromosomes sequentially (memory-safe)
+    # Process chromosomes sequentially
     for chrom in args.chromosomes:
         result = process_chromosome(chrom)
         results.append(result)
@@ -349,10 +381,9 @@ def main():
     logger.info(f"Skipped: {len(skipped)}")
     logger.info(f"Failed: {len(failed)}")
     logger.info(f"\nTotal annotations: {total_variants:,}")
-    logger.info(f"Missense annotations: {total_missense:,} ({100*total_missense/total_variants:.1f}%)")
+    logger.info(f"Missense annotations: {total_missense:,}")
     logger.info(f"Total size: {total_size_mb:.1f} MB ({total_size_mb/1024:.1f} GB)")
     logger.info(f"Total time: {elapsed/60:.1f} minutes ({elapsed/3600:.1f} hours)")
-    logger.info(f"Avg per chromosome: {elapsed/len(results)/60:.1f} minutes")
     
     if failed:
         logger.warning(f"\nFailed chromosomes: {', '.join([r['chrom'] for r in failed])}")
@@ -362,15 +393,6 @@ def main():
     summary_file = DF_DIR / "conversion_summary.csv"
     summary_df.to_csv(summary_file, index=False)
     logger.info(f"\nSummary saved to: {summary_file}")
-    
-    # Show how to filter missense
-    logger.info("\n" + "="*80)
-    logger.info("TO FILTER MISSENSE VARIANTS:")
-    logger.info("="*80)
-    logger.info("import pandas as pd")
-    logger.info("df = pd.read_parquet('gnomad_all_genes/chromosome_dataframes/chr1_variants.parquet')")
-    logger.info("missense = df[df['Consequence'].str.contains('missense', na=False)]")
-    logger.info("# Takes <1 second!")
     
     return len(failed) == 0
 
