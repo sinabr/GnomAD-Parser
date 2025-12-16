@@ -2,6 +2,9 @@
 # Lightweight local runner for quick testing on an interactive node (no SLURM).
 # Assumes only 2 CPU cores are available.
 
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate protein
+
 set -euo pipefail
 
 # Activate environment (adjust if your conda is elsewhere). Temporarily disable
