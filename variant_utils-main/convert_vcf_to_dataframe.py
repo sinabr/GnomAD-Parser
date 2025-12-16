@@ -37,7 +37,7 @@ DF_DIR = Path("gnomad_all_genes/chromosome_dataframes")
 CHROMOSOMES = [str(i) for i in range(1, 23)] + ['X', 'Y']
 
 # Chunk size (tune based on memory)
-CHUNK_SIZE = 500000  # Process 500K variants at a time
+CHUNK_SIZE = 5000000  # Process 500K variants at a time
 
 
 def get_vep_columns_from_header(vcf_path: str) -> List[str]:
@@ -101,7 +101,7 @@ def process_vcf_in_chunks(vcf_path: Path, vep_columns: List[str], output_file: P
         variants_total += 1
         
         # Progress indicator
-        if variants_total % 1000000 == 0:
+        if variants_total % 10000000 == 0:
             logger.info(f"    Processed {variants_total:,} variants, kept {variants_kept:,}...")
         
         # Filter: SNPs only
