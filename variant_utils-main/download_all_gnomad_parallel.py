@@ -206,7 +206,8 @@ def extract_chromosome_vcf(
     chrom: str,
     genes_df: pd.DataFrame,
     external_config: dict,
-    bcftools_cmd: str
+    bcftools_cmd: str,
+    bcftools_threads: int
 ) -> Tuple[Path, Path]:
     """
     Extract entire chromosome VCF for all genes at once (exomes + genomes).
@@ -265,21 +266,20 @@ def extract_chromosome_vcf(
         chrom_length = chrom_lengths_grch38.get(chrom, 250000000)
         logger.info(f"  Using approximate chromosome length: {chrom_length}")
 
-    # Get regions for all genes on this chromosome
-    min_pos = genes_df['gene_start'].min()
-    max_pos = genes_df['gene_end'].max()
+    # Extract entire chromosome for complete coverage
+    # This ensures we don't miss any variants (regulatory, UTR, etc.)
+    # One-time cost (~10-20 min per chromosome), then cached for all genes
+    logger.info(f"  Extracting entire chromosome {chr_prefix}{chrom} (complete variant coverage)")
+    logger.info(f"  This takes 10-20 minutes but ensures no missed variants and is cached for future runs")
 
-    # Add buffer (100kb on each side) but don't exceed chromosome boundaries
-    min_pos = max(1, min_pos - 100000)
-    max_pos = min(chrom_length, max_pos + 100000)
-
-    logger.info(f"  Extracting region {chr_prefix}{chrom}:{min_pos}-{max_pos} (chr length: {chrom_length})")
-
-    # OPTIMIZED: Use bcftools instead of GATK (10-50x faster)
+    # OPTIMIZED: Use bcftools instead of GATK (still 5-10x faster than GATK)
     # Extract exomes with bcftools
+    threads_flag = str(max(1, bcftools_threads))
+
     cmd_exomes = [
         bcftools_cmd, "view",
-        "-r", f"{chr_prefix}{chrom}:{min_pos}-{max_pos}",
+        "--threads", threads_flag,
+        "-r", f"{chr_prefix}{chrom}",
         "-i", 'TYPE="snp" && FILTER="PASS"',
         str(gnomAD_exomes),
         "-Oz", "-o", str(cache_exomes)
@@ -292,13 +292,14 @@ def extract_chromosome_vcf(
 
     # Index exomes
     logger.info("  Indexing exomes...")
-    subprocess.run([bcftools_cmd, "index", "-t", str(cache_exomes)],
+    subprocess.run([bcftools_cmd, "index", "-t", "-@", threads_flag, str(cache_exomes)],
                    capture_output=True, text=True, check=True)
 
     # Extract genomes with bcftools
     cmd_genomes = [
         bcftools_cmd, "view",
-        "-r", f"{chr_prefix}{chrom}:{min_pos}-{max_pos}",
+        "--threads", threads_flag,
+        "-r", f"{chr_prefix}{chrom}",
         "-i", 'TYPE="snp" && FILTER="PASS"',
         str(gnomAD_genomes),
         "-Oz", "-o", str(cache_genomes)
@@ -311,7 +312,7 @@ def extract_chromosome_vcf(
 
     # Index genomes
     logger.info("  Indexing genomes...")
-    subprocess.run([bcftools_cmd, "index", "-t", str(cache_genomes)],
+    subprocess.run([bcftools_cmd, "index", "-t", "-@", threads_flag, str(cache_genomes)],
                    capture_output=True, text=True, check=True)
 
     logger.info(f"✅ Chromosome {chrom} VCFs extracted and cached with bcftools")
@@ -423,6 +424,7 @@ def process_chromosome(
     external_config: dict,
     assembly: str,
     bcftools_cmd: str,
+    bcftools_threads: int,
     gene_workers: int = 2
 ) -> List[Dict]:
     """
@@ -443,7 +445,7 @@ def process_chromosome(
     # Step 1: Extract chromosome VCFs (or use cache)
     try:
         exomes_vcf, genomes_vcf = extract_chromosome_vcf(
-            assembly, chrom, genes_df, external_config, bcftools_cmd
+            assembly, chrom, genes_df, external_config, bcftools_cmd, bcftools_threads
         )
     except Exception as e:
         logger.error(f"Failed to extract chromosome {chrom} VCFs: {e}")
@@ -532,6 +534,7 @@ def query_all_genes_by_chromosome(
     """
     # Resolve bcftools path once
     bcftools_cmd = resolve_bcftools(external_config)
+    bcftools_threads = max(1, int(os.environ.get("BCFTOOLS_THREADS", "2")))
 
     # Load progress
     progress = load_progress() if resume else {
@@ -594,7 +597,7 @@ def query_all_genes_by_chromosome(
         # Sequential chromosome processing (memory-safe)
         for chrom, genes in chromosomes_to_process:
             results = process_chromosome(
-                chrom, genes, external_config, assembly, bcftools_cmd, gene_workers
+                chrom, genes, external_config, assembly, bcftools_cmd, bcftools_threads, gene_workers
             )
             
             # Update progress
@@ -619,7 +622,7 @@ def query_all_genes_by_chromosome(
             futures = {
                 executor.submit(
                     process_chromosome,
-                    chrom, genes, external_config, assembly, bcftools_cmd, gene_workers
+                    chrom, genes, external_config, assembly, bcftools_cmd, bcftools_threads, gene_workers
                 ): chrom
                 for chrom, genes in chromosomes_to_process
             }
