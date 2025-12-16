@@ -51,7 +51,7 @@ def run_single_chrom(
     logger.info(f"bcftools: {bcftools_cmd} (threads={bcftools_threads})")
 
     genes_df = get_all_genes_from_mane()
-    genes_df = genes_df[genes_df["CHROM"].astype(str) == str(chrom)]
+    genes_df = genes_df[genes_df["chrom"].astype(str) == str(chrom)]
 
     if max_genes > 0:
         genes_df = genes_df.head(max_genes)

@@ -93,6 +93,37 @@ def resolve_bcftools(external_config: Dict) -> str:
     )
 
 
+def index_vcf_with_fallback(vcf_path: Path, bcftools_cmd: str, threads: int):
+    """
+    Index a bgzipped VCF using bcftools. Try tabix (-t) first, then CSI (-c) if needed.
+    """
+    threads_flag = str(max(1, threads))
+    # Try TBI
+    result = subprocess.run(
+        [bcftools_cmd, "index", "-t", "-@", threads_flag, str(vcf_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return
+
+    logger.warning(
+        f"bcftools index -t failed for {vcf_path} (rc={result.returncode}): {result.stderr.strip()}"
+    )
+    # Fallback to CSI
+    result_csi = subprocess.run(
+        [bcftools_cmd, "index", "-c", "-@", threads_flag, str(vcf_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result_csi.returncode != 0:
+        raise RuntimeError(
+            f"Failed to index {vcf_path} with bcftools.\n"
+            f"TBI stderr: {result.stderr}\n"
+            f"CSI stderr: {result_csi.stderr}"
+        )
+
+
 # ============================================================================
 # GENE LOADING (optimized with caching)
 # ============================================================================
@@ -292,8 +323,7 @@ def extract_chromosome_vcf(
 
     # Index exomes
     logger.info("  Indexing exomes...")
-    subprocess.run([bcftools_cmd, "index", "-t", "-@", threads_flag, str(cache_exomes)],
-                   capture_output=True, text=True, check=True)
+    index_vcf_with_fallback(cache_exomes, bcftools_cmd, bcftools_threads)
 
     # Extract genomes with bcftools
     cmd_genomes = [
@@ -312,8 +342,7 @@ def extract_chromosome_vcf(
 
     # Index genomes
     logger.info("  Indexing genomes...")
-    subprocess.run([bcftools_cmd, "index", "-t", "-@", threads_flag, str(cache_genomes)],
-                   capture_output=True, text=True, check=True)
+    index_vcf_with_fallback(cache_genomes, bcftools_cmd, bcftools_threads)
 
     logger.info(f"✅ Chromosome {chrom} VCFs extracted and cached with bcftools")
 
