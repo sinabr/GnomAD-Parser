@@ -64,7 +64,7 @@ echo "Start time: $(date)"
 echo ""
 
 # Run optimized conversion
-python convert_vcf_to_dataframe_optimized.py
+python convert_vcf_to_dataframe.py
 
 EXIT_CODE=$?
 
