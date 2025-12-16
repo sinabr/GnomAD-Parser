@@ -78,7 +78,7 @@ def parse_vep_annotation(vep_string: str, columns: List[str]) -> List[Dict]:
 
 
 def process_vcf_in_chunks(vcf_path: Path, vep_columns: List[str], output_file: Path, 
-                          source_label: str, is_first_file: bool = True):
+                          source_label: str, chunk_size: int, is_first_file: bool = True):
     """
     Process VCF in chunks and append to Parquet file.
     
@@ -157,7 +157,7 @@ def process_vcf_in_chunks(vcf_path: Path, vep_columns: List[str], output_file: P
             chunk_records.append(full_record)
         
         # Write chunk when it reaches size limit
-        if len(chunk_records) >= CHUNK_SIZE:
+        if len(chunk_records) >= chunk_size:
             chunk_df = pd.DataFrame(chunk_records)
             
             # Optimize dtypes
@@ -207,12 +207,12 @@ def process_vcf_in_chunks(vcf_path: Path, vep_columns: List[str], output_file: P
     
     logger.info(f"    Total variants: {variants_total:,}")
     logger.info(f"    SNPs + PASS: {variants_kept:,}")
-    logger.info(f"    Annotations written: {chunks_written * CHUNK_SIZE + len(chunk_records):,}")
+    logger.info(f"    Annotations written: {chunks_written * chunk_size + len(chunk_records):,}")
     
     return variants_kept
 
 
-def process_chromosome(chrom: str) -> Dict:
+def process_chromosome(chrom: str, chunk_size: int = CHUNK_SIZE) -> Dict:
     """Process one chromosome with memory-efficient chunking."""
     logger.info(f"\n{'='*80}")
     logger.info(f"Processing Chromosome {chrom}")
@@ -252,17 +252,17 @@ def process_chromosome(chrom: str) -> Dict:
         # Get VEP columns
         vep_columns = get_vep_columns_from_header(str(exomes_source))
         logger.info(f"VEP columns: {len(vep_columns)} fields")
-        logger.info(f"Chunk size: {CHUNK_SIZE:,} variants per batch")
+        logger.info(f"Chunk size: {chunk_size:,} variants per batch")
         
         # Process exomes (writes to temp file)
         temp_exomes = DF_DIR / f".tmp_chr{chrom}_exomes.parquet"
         logger.info("Processing EXOMES in chunks...")
-        exomes_count = process_vcf_in_chunks(exomes_source, vep_columns, temp_exomes, 'exomes', True)
+        exomes_count = process_vcf_in_chunks(exomes_source, vep_columns, temp_exomes, 'exomes', chunk_size, True)
         
         # Process genomes (writes to temp file)
         temp_genomes = DF_DIR / f".tmp_chr{chrom}_genomes.parquet"
         logger.info("Processing GENOMES in chunks...")
-        genomes_count = process_vcf_in_chunks(genomes_source, vep_columns, temp_genomes, 'genomes', False)
+        genomes_count = process_vcf_in_chunks(genomes_source, vep_columns, temp_genomes, 'genomes', chunk_size, False)
         
         # Merge the two files
         logger.info("Merging exomes and genomes...")
@@ -336,8 +336,7 @@ def main():
                        help=f'Chunk size for processing (default: {CHUNK_SIZE})')
     args = parser.parse_args()
     
-    global CHUNK_SIZE
-    CHUNK_SIZE = args.chunk_size
+    chunk_size = args.chunk_size
     
     logger.info("\n" + "="*80)
     logger.info("MEMORY-EFFICIENT VCF TO DATAFRAME CONVERSION")
@@ -346,7 +345,7 @@ def main():
     logger.info(f"Source genomes: {SOURCE_GENOMES}")
     logger.info(f"Output directory: {DF_DIR}")
     logger.info(f"Chromosomes: {', '.join(args.chromosomes)}")
-    logger.info(f"Chunk size: {CHUNK_SIZE:,} variants")
+    logger.info(f"Chunk size: {chunk_size:,} variants")
     logger.info("")
     logger.info("OPTIMIZATION: Chunked processing")
     logger.info("              Peak memory: ~10-15 GB (vs 60+ GB before)")
@@ -359,7 +358,7 @@ def main():
     
     # Process chromosomes sequentially
     for chrom in args.chromosomes:
-        result = process_chromosome(chrom)
+        result = process_chromosome(chrom, chunk_size)
         results.append(result)
     
     # Summary
