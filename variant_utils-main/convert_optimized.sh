@@ -10,10 +10,12 @@
 #SBATCH --output=logs/gnomad_%A_%a.out
 #SBATCH --error=logs/gnomad_%A_%a.err
 
-set -euo pipefail
+
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate protein
+
+set -euo pipefail
 
 mkdir -p logs
 mkdir -p gnomad_all_genes/chromosome_dataframes
