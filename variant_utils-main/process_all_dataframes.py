@@ -368,40 +368,74 @@ def process_chrom(chrom: str, input_dir: Path, output_dir: Path, reference_dir: 
 # =========================
 # Combine step (streaming)
 # =========================
-def stream_write_dataset(input_files: List[Path], out_path: Path, kind: str, batch_size: int) -> int:
-    dataset = ds.dataset([str(p) for p in input_files], format="parquet")
-    f_verified = (ds.field("seq_verified_i8") == 1)
-    f_mane = (ds.field("is_mane_select") == True)
 
-    if kind == "all":
-        filt = None
-    elif kind == "verified":
-        filt = f_verified
-    elif kind == "mane":
-        filt = f_mane
-    elif kind == "gold":
-        filt = f_verified & f_mane
+
+def _ensure_column(table: pa.Table, name: str, typ: pa.DataType) -> pa.Table:
+    if name in table.schema.names:
+        col = table[name]
+        # If this fragment wrote it as null type, promote it to requested type
+        if pa.types.is_null(col.type):
+            return table.set_column(table.schema.get_field_index(name), name, pa.array([None] * table.num_rows, type=typ))
+        # If different type, try safe cast
+        if col.type != typ:
+            try:
+                return table.set_column(table.schema.get_field_index(name), name, pc.cast(col, typ, safe=False))
+            except Exception:
+                # fallback: leave as-is
+                return table
+        return table
     else:
-        raise ValueError(kind)
+        # Column missing in this file: add as nulls of desired type
+        return table.append_column(name, pa.array([None] * table.num_rows, type=typ))
 
-    scanner = dataset.scanner(filter=filt, batch_size=batch_size)
-
-    writer: Optional[pq.ParquetWriter] = None
+def stream_write_dataset(files, out_path, kind: str, batch_size: int) -> int:
+    """
+    Robust combine:
+    - scans each parquet file independently (no schema unification across files)
+    - promotes missing/null-typed columns on the fly
+    - applies filters per batch
+    """
+    writer = None
     n = 0
-    try:
+
+    for fp in files:
+        d = ds.dataset(str(fp), format="parquet")
+        scanner = d.scanner(batch_size=batch_size)  # no filter here; we filter per batch safely
+
         for rb in scanner.to_batches():
             table = pa.Table.from_batches([rb])
+
+            # Ensure columns exist with stable types used in filtering
+            table = _ensure_column(table, "seq_verified_i8", pa.int8())
+            table = _ensure_column(table, "is_mane_select", pa.bool_())
+
+            if kind == "verified":
+                mask = pc.equal(table["seq_verified_i8"], pa.scalar(1, pa.int8()))
+                table = table.filter(mask)
+            elif kind == "mane":
+                mask = pc.equal(table["is_mane_select"], pa.scalar(True, pa.bool_()))
+                table = table.filter(mask)
+            elif kind == "gold":
+                m1 = pc.equal(table["seq_verified_i8"], pa.scalar(1, pa.int8()))
+                m2 = pc.equal(table["is_mane_select"], pa.scalar(True, pa.bool_()))
+                table = table.filter(pc.and_(m1, m2))
+            # kind == "all": no filtering
+
             if table.num_rows == 0:
                 continue
+
             if writer is None:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 writer = pq.ParquetWriter(str(out_path), table.schema, compression="snappy")
+
             writer.write_table(table)
             n += table.num_rows
-    finally:
-        if writer is not None:
-            writer.close()
+
+    if writer is not None:
+        writer.close()
+
     return n
+
 
 
 def combine(output_dir: Path, batch_size: int) -> int:
