@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-missense_pipeline_final.py
+missense_pipeline_robust.py
 
-Memory-safe missense processing for gnomAD chromosome Parquets.
+Memory-safe + schema-robust missense processing for chromosome Parquets.
+
+Fixes:
+- Some Parquets don't have SIFT / PolyPhen (or other optional fields)
+- Different chromosomes can have different schemas
+- Arrow projection now uses only columns that exist in that file
 
 Modes:
-  1) process-chrom  : stream one chr{chrom}_variants.parquet -> chr{chrom}_missense_enriched.parquet
-  2) combine        : stream-combine per-chrom enriched files -> all/verified/mane/gold + statistics.json
-
-Key properties:
-- DOES NOT load an entire chromosome into RAM
-- DOES NOT accumulate chromosomes in memory
-- DOES NOT store full protein sequences per variant row
-- Uses Arrow Dataset scanning + batch processing
+  process-chrom : one chromosome -> one output parquet + stats
+  combine       : stream-combine per-chrom outputs into all/verified/mane/gold + statistics.json
 """
 
 from __future__ import annotations
@@ -21,30 +20,25 @@ import argparse
 import gzip
 import json
 import logging
-import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 
-# -----------------------------
-# Logging
-# -----------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("missense_pipeline_final")
+logger = logging.getLogger("missense_pipeline_robust")
 
 
-# -----------------------------
+# =========================
 # Reference loaders
-# -----------------------------
+# =========================
 def load_enst_to_ensp(gtf_path: Path) -> Dict[str, str]:
     logger.info(f"   Parsing GTF: {gtf_path.name}")
     enst_to_ensp: Dict[str, str] = {}
@@ -139,15 +133,12 @@ def load_mane_transcripts(mane_path: Path) -> Dict[str, Dict]:
             parts = line.strip().split("\t")
             if len(parts) != len(header):
                 continue
-
             status = parts[i_status] if i_status >= 0 else ""
             if status not in ("MANE Select", "MANE_Select"):
                 continue
-
             symbol = parts[i_symbol] if i_symbol >= 0 else ""
             enst = parts[i_enst] if i_enst >= 0 else ""
             nm = parts[i_nm] if i_nm >= 0 else ""
-
             if symbol and enst:
                 mane_data[symbol] = {"enst": enst.split(".")[0], "refseq": nm or ""}
 
@@ -158,21 +149,19 @@ def load_mane_transcripts(mane_path: Path) -> Dict[str, Dict]:
 def load_uniprot_id_mapping(idmapping_path: Path) -> Dict[str, str]:
     logger.info(f"   Parsing UniProt ID mapping: {idmapping_path.name}")
     gene_to_uniprot: Dict[str, str] = {}
-
     with gzip.open(idmapping_path, "rt") as f:
         for line in f:
             parts = line.strip().split("\t")
             if len(parts) == 3 and parts[1] == "Gene_Name":
                 if parts[2] not in gene_to_uniprot:
                     gene_to_uniprot[parts[2]] = parts[0]
-
     logger.info(f"      Found {len(gene_to_uniprot):,} gene→UniProt mappings")
     return gene_to_uniprot
 
 
-# -----------------------------
-# Fast HGVSp parsing (vectorized)
-# -----------------------------
+# =========================
+# Fast HGVSp parsing
+# =========================
 AA_3TO1 = {
     "Ala": "A", "Arg": "R", "Asn": "N", "Asp": "D", "Cys": "C",
     "Gln": "Q", "Glu": "E", "Gly": "G", "His": "H", "Ile": "I",
@@ -183,7 +172,6 @@ AA_3TO1 = {
 
 def parse_hgvsp_cols(hgvsp: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
     s = hgvsp.astype("string")
-    # normalize "ENSP...:p." -> "p."
     s = s.str.replace(r"^.*?:p\.", "p.", regex=True)
 
     m3 = s.str.extract(r"p\.([A-Z][a-z]{2})(\d+)([A-Z][a-z]{2}|\=)")
@@ -204,9 +192,6 @@ def parse_hgvsp_cols(hgvsp: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]
     return ref, pos, alt
 
 
-# -----------------------------
-# Fast seq verification (tight loop on valid subset)
-# -----------------------------
 def verify_seq_fast(feature: pd.Series, pos: pd.Series, ref: pd.Series, enst_to_seq: Dict[str, str]) -> pd.Series:
     feat_u = feature.astype("string").str.split(".", n=1).str[0]
     ref_s = ref.astype("string")
@@ -232,93 +217,99 @@ def verify_seq_fast(feature: pd.Series, pos: pd.Series, ref: pd.Series, enst_to_
     return pd.Series(out, index=feature.index, dtype="object")
 
 
-# -----------------------------
-# Streaming Parquet batch iterator (Arrow)
-# -----------------------------
-INPUT_COLS = [
-    "CHROM", "POS", "REF", "ALT", "source",
+# =========================
+# Schema-robust streaming
+# =========================
+CORE_COLS = [
+    "CHROM", "POS", "REF", "ALT",
     "Consequence", "SYMBOL", "Gene", "Feature", "HGVSc", "HGVSp",
-    "CANONICAL", "MANE_SELECT", "MANE_PLUS_CLINICAL",
-    "BIOTYPE", "IMPACT", "PolyPhen", "SIFT",
+    "CANONICAL", "MANE_SELECT", "MANE_PLUS_CLINICAL", "BIOTYPE", "IMPACT",
 ]
 
-OUTPUT_EXTRA_COLS = [
-    "ref_aa", "protein_pos", "alt_aa", "mutation",
-    "seq_verified", "uniprot_id", "alphafold_id", "is_mane_select",
+OPTIONAL_COLS = [
+    "source", "FILTER",
+    "SIFT", "PolyPhen",   # often missing -> handled safely
 ]
+
+OUTPUT_EXTRA = ["ref_aa", "protein_pos", "alt_aa", "mutation", "seq_verified", "uniprot_id", "alphafold_id", "is_mane_select"]
+
+def available_columns(parquet_path: Path) -> List[str]:
+    pf = pq.ParquetFile(str(parquet_path))
+    return pf.schema.names
 
 def iter_missense_batches(parquet_path: Path, batch_size: int):
+    cols_in_file = set(available_columns(parquet_path))
+
+    needed = [c for c in CORE_COLS + OPTIONAL_COLS if c in cols_in_file]
+    # must have these minimums, otherwise cannot proceed
+    min_required = {"Consequence", "SYMBOL", "Feature", "HGVSp"}
+    if not min_required.issubset(cols_in_file):
+        missing = sorted(list(min_required - cols_in_file))
+        raise RuntimeError(f"{parquet_path.name} missing required columns: {missing}")
+
     dataset = ds.dataset(str(parquet_path), format="parquet")
 
-    # Filter at scan-time when possible (saves I/O)
-    # Some files may not be string type; cast defensively.
+    # scan-time filter (fast)
     try:
         filt = pc.match_substring(pc.cast(ds.field("Consequence"), pa.string()), "missense_variant")
     except Exception:
         filt = None
 
-    scanner = dataset.scanner(columns=INPUT_COLS, filter=filt, batch_size=batch_size)
+    scanner = dataset.scanner(columns=needed, filter=filt, batch_size=batch_size)
+
     for rb in scanner.to_batches():
         table = pa.Table.from_batches([rb])
         df = table.to_pandas(types_mapper=pd.ArrowDtype)
 
-        # Safety filter (Consequence can be comma-separated)
+        # safety contains (handles comma-separated)
         mask = df["Consequence"].astype("string").str.contains("missense_variant", case=False, na=False)
         df = df.loc[mask]
-        if len(df):
-            yield df
+        if len(df) == 0:
+            continue
+
+        # ensure all expected columns exist (fill missing optional as NA)
+        for c in CORE_COLS + OPTIONAL_COLS:
+            if c not in df.columns:
+                df[c] = pd.NA
+
+        yield df
 
 
-def append_parquet(out_path: Path, df: pd.DataFrame, writer: Optional[pq.ParquetWriter]) -> pq.ParquetWriter:
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    if writer is None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        writer = pq.ParquetWriter(str(out_path), table.schema, compression="snappy")
-    writer.write_table(table)
-    return writer
-
-
-# -----------------------------
+# =========================
 # Process one chromosome
-# -----------------------------
-def process_chrom(args) -> int:
-    chrom = args.chrom
-    input_path = args.input_dir / f"chr{chrom}_variants.parquet"
-    if not input_path.exists():
-        logger.error(f"Missing input parquet: {input_path}")
+# =========================
+def process_chrom(chrom: str, input_dir: Path, output_dir: Path, reference_dir: Path, batch_size: int) -> int:
+    in_path = input_dir / f"chr{chrom}_variants.parquet"
+    if not in_path.exists():
+        logger.error(f"Missing: {in_path}")
         return 2
 
-    out_dir = args.output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    out_parquet = out_dir / f"chr{chrom}_missense_enriched.parquet"
-    out_stats = out_dir / f"chr{chrom}_stats.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_parquet = output_dir / f"chr{chrom}_missense_enriched.parquet"
+    out_stats = output_dir / f"chr{chrom}_stats.json"
 
     t0 = time.time()
 
-    # Load references once per job
-    ref_dir = args.reference_dir
     logger.info("Loading reference caches...")
     enst_to_seq = build_enst_to_seq(
-        ref_dir / "ensembl" / "Homo_sapiens.GRCh38.112.gtf.gz",
-        ref_dir / "ensembl" / "Homo_sapiens.GRCh38.pep.all.fa.gz",
+        reference_dir / "ensembl" / "Homo_sapiens.GRCh38.112.gtf.gz",
+        reference_dir / "ensembl" / "Homo_sapiens.GRCh38.pep.all.fa.gz",
     )
-    mane = load_mane_transcripts(ref_dir / "mane" / "MANE.GRCh38.v1.3.summary.txt.gz")
-    gene_to_uniprot = load_uniprot_id_mapping(ref_dir / "uniprot" / "HUMAN_9606_idmapping.dat.gz")
+    mane = load_mane_transcripts(reference_dir / "mane" / "MANE.GRCh38.v1.3.summary.txt.gz")
+    gene_to_uniprot = load_uniprot_id_mapping(reference_dir / "uniprot" / "HUMAN_9606_idmapping.dat.gz")
 
     writer: Optional[pq.ParquetWriter] = None
 
     total = 0
-    with_seq_info = 0
     verified_true = 0
-    with_uniprot = 0
+    verified_non_na = 0
     mane_true = 0
+    with_uniprot = 0
 
-    logger.info(f"chr{chrom}: streaming batches from {input_path.name}")
-    for df in iter_missense_batches(input_path, batch_size=args.batch_size):
+    logger.info(f"chr{chrom}: streaming batches from {in_path.name}")
+    for df in iter_missense_batches(in_path, batch_size=batch_size):
         total += len(df)
 
-        # HGVSp parse
         ref_aa, prot_pos, alt_aa = parse_hgvsp_cols(df["HGVSp"])
         df["ref_aa"] = ref_aa
         df["protein_pos"] = prot_pos
@@ -329,30 +320,28 @@ def process_chrom(args) -> int:
             + df["alt_aa"].astype("string")
         )
 
-        # Sequence verification (no sequences stored)
         df["seq_verified"] = verify_seq_fast(df["Feature"], df["protein_pos"], df["ref_aa"], enst_to_seq)
-        with_seq_info += int(df["seq_verified"].notna().sum())
+        verified_non_na += int(df["seq_verified"].notna().sum())
         verified_true += int((df["seq_verified"] == True).sum())
 
-        # UniProt + AF ids
         df["uniprot_id"] = df["SYMBOL"].astype("string").map(gene_to_uniprot)
         df["alphafold_id"] = df["uniprot_id"].apply(lambda x: f"AF-{x}-F1" if pd.notna(x) and x else pd.NA)
         with_uniprot += int(df["uniprot_id"].notna().sum())
 
-        # MANE select flag
         feat_u = df["Feature"].astype("string").str.split(".", n=1).str[0]
         mane_enst = df["SYMBOL"].astype("string").map(lambda s: mane.get(s, {}).get("enst") if pd.notna(s) else None)
         df["is_mane_select"] = mane_enst.notna() & (feat_u == mane_enst.astype("string"))
         mane_true += int(df["is_mane_select"].sum())
 
-        # Write only necessary columns
-        keep_cols = [c for c in INPUT_COLS + OUTPUT_EXTRA_COLS if c in df.columns]
-        df_out = df[keep_cols].copy()
+        keep = [c for c in (CORE_COLS + OPTIONAL_COLS + OUTPUT_EXTRA) if c in df.columns]
+        df_out = df[keep].copy()
 
-        writer = append_parquet(out_parquet, df_out, writer)
+        table = pa.Table.from_pandas(df_out, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(str(out_parquet), table.schema, compression="snappy")
+        writer.write_table(table)
 
-        # Encourage early release
-        del df, df_out
+        del df, df_out, table
 
     if writer is not None:
         writer.close()
@@ -360,26 +349,25 @@ def process_chrom(args) -> int:
     stats = {
         "chrom": chrom,
         "total_missense": total,
-        "with_seq_info": with_seq_info,
-        "verified_true": verified_true,
-        "with_uniprot": with_uniprot,
+        "seq_verified_non_na": verified_non_na,
+        "seq_verified_true": verified_true,
         "mane_select_true": mane_true,
+        "with_uniprot": with_uniprot,
         "minutes": round((time.time() - t0) / 60, 2),
         "out_file": str(out_parquet),
     }
     with open(out_stats, "w") as f:
         json.dump(stats, f, indent=2)
 
-    logger.info(f"chr{chrom}: ✅ done missense={total:,} time={stats['minutes']} min")
+    logger.info(f"chr{chrom}: ✅ done missense={total:,} time={stats['minutes']} min -> {out_parquet.name}")
     return 0
 
 
-# -----------------------------
-# Combine per-chrom outputs (memory-safe streaming)
-# -----------------------------
+# =========================
+# Combine step (streaming)
+# =========================
 def stream_write_dataset(input_files: List[Path], out_path: Path, kind: str, batch_size: int) -> int:
     dataset = ds.dataset([str(p) for p in input_files], format="parquet")
-
     f_verified = (ds.field("seq_verified") == True)
     f_mane = (ds.field("is_mane_select") == True)
 
@@ -414,45 +402,44 @@ def stream_write_dataset(input_files: List[Path], out_path: Path, kind: str, bat
     return n
 
 
-def combine(args) -> int:
-    out_dir = args.output_dir
-    inputs = sorted(out_dir.glob("chr*_missense_enriched.parquet"))
-    if not inputs:
-        logger.error(f"No per-chrom files found in {out_dir}")
+def combine(output_dir: Path, batch_size: int) -> int:
+    files = sorted(output_dir.glob("chr*_missense_enriched.parquet"))
+    if not files:
+        logger.error(f"No per-chrom outputs found in {output_dir}")
         return 2
 
     t0 = time.time()
-    out_all = out_dir / "all_missense_variants.parquet"
-    out_verified = out_dir / "verified_missense_variants.parquet"
-    out_mane = out_dir / "mane_select_missense_variants.parquet"
-    out_gold = out_dir / "gold_standard_missense_variants.parquet"
+    out_all = output_dir / "all_missense_variants.parquet"
+    out_ver = output_dir / "verified_missense_variants.parquet"
+    out_mane = output_dir / "mane_select_missense_variants.parquet"
+    out_gold = output_dir / "gold_standard_missense_variants.parquet"
 
-    n_all = stream_write_dataset(inputs, out_all, "all", args.batch_size)
-    n_ver = stream_write_dataset(inputs, out_verified, "verified", args.batch_size)
-    n_man = stream_write_dataset(inputs, out_mane, "mane", args.batch_size)
-    n_gol = stream_write_dataset(inputs, out_gold, "gold", args.batch_size)
+    n_all = stream_write_dataset(files, out_all, "all", batch_size)
+    n_ver = stream_write_dataset(files, out_ver, "verified", batch_size)
+    n_man = stream_write_dataset(files, out_mane, "mane", batch_size)
+    n_gol = stream_write_dataset(files, out_gold, "gold", batch_size)
 
     stats = {
-        "per_chrom_files": len(inputs),
+        "per_chrom_files": len(files),
         "combined_rows": {"all": n_all, "verified": n_ver, "mane": n_man, "gold": n_gol},
         "minutes": round((time.time() - t0) / 60, 2),
     }
-    with open(out_dir / "statistics.json", "w") as f:
+    with open(output_dir / "statistics.json", "w") as f:
         json.dump(stats, f, indent=2)
 
     logger.info(f"✅ combine done in {stats['minutes']} min (all={n_all:,})")
     return 0
 
 
-# -----------------------------
+# =========================
 # CLI
-# -----------------------------
+# =========================
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("process-chrom")
-    p.add_argument("--chrom", required=True, help="1..22, X, Y")
+    p.add_argument("--chrom", required=True)
     p.add_argument("--input_dir", type=Path, required=True)
     p.add_argument("--output_dir", type=Path, required=True)
     p.add_argument("--reference_dir", type=Path, required=True)
@@ -465,9 +452,15 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.cmd == "process-chrom":
-        return process_chrom(args)
+        return process_chrom(
+            chrom=args.chrom,
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            reference_dir=args.reference_dir,
+            batch_size=args.batch_size,
+        )
     else:
-        return combine(args)
+        return combine(args.output_dir, args.batch_size)
 
 
 if __name__ == "__main__":
