@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-missense_pipeline_robust.py
+missense_pipeline_robust_v2.py
 
-Memory-safe + schema-robust missense processing for chromosome Parquets.
+Fixes schema mismatch across batches by writing seq_verified as int8:
+  1=True, 0=False, -1=NA
 
-Fixes:
-- Some Parquets don't have SIFT / PolyPhen (or other optional fields)
-- Different chromosomes can have different schemas
-- Arrow projection now uses only columns that exist in that file
-
-Modes:
-  process-chrom : one chromosome -> one output parquet + stats
-  combine       : stream-combine per-chrom outputs into all/verified/mane/gold + statistics.json
+Everything else remains streaming + schema-robust.
 """
 
 from __future__ import annotations
@@ -33,7 +27,7 @@ import pyarrow.parquet as pq
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("missense_pipeline_robust")
+logger = logging.getLogger("missense_pipeline_robust_v2")
 
 
 # =========================
@@ -160,7 +154,7 @@ def load_uniprot_id_mapping(idmapping_path: Path) -> Dict[str, str]:
 
 
 # =========================
-# Fast HGVSp parsing
+# HGVSp parsing + seq verify
 # =========================
 AA_3TO1 = {
     "Ala": "A", "Arg": "R", "Asn": "N", "Asp": "D", "Cys": "C",
@@ -217,31 +211,37 @@ def verify_seq_fast(feature: pd.Series, pos: pd.Series, ref: pd.Series, enst_to_
     return pd.Series(out, index=feature.index, dtype="object")
 
 
+def seq_verified_to_int8(s: pd.Series) -> pd.Series:
+    # 1=True, 0=False, -1=NA
+    out = pd.Series(np.full(len(s), -1, dtype=np.int8), index=s.index)
+    out.loc[s == True] = 1
+    out.loc[s == False] = 0
+    return out
+
+
 # =========================
-# Schema-robust streaming
+# Streaming (schema-robust)
 # =========================
 CORE_COLS = [
     "CHROM", "POS", "REF", "ALT",
     "Consequence", "SYMBOL", "Gene", "Feature", "HGVSc", "HGVSp",
     "CANONICAL", "MANE_SELECT", "MANE_PLUS_CLINICAL", "BIOTYPE", "IMPACT",
 ]
+OPTIONAL_COLS = ["source", "FILTER", "SIFT", "PolyPhen"]
 
-OPTIONAL_COLS = [
-    "source", "FILTER",
-    "SIFT", "PolyPhen",   # often missing -> handled safely
+OUTPUT_EXTRA = [
+    "ref_aa", "protein_pos", "alt_aa", "mutation",
+    "seq_verified_i8", "uniprot_id", "alphafold_id", "is_mane_select",
 ]
 
-OUTPUT_EXTRA = ["ref_aa", "protein_pos", "alt_aa", "mutation", "seq_verified", "uniprot_id", "alphafold_id", "is_mane_select"]
-
 def available_columns(parquet_path: Path) -> List[str]:
-    pf = pq.ParquetFile(str(parquet_path))
-    return pf.schema.names
+    return pq.ParquetFile(str(parquet_path)).schema.names
+
 
 def iter_missense_batches(parquet_path: Path, batch_size: int):
     cols_in_file = set(available_columns(parquet_path))
+    needed = [c for c in (CORE_COLS + OPTIONAL_COLS) if c in cols_in_file]
 
-    needed = [c for c in CORE_COLS + OPTIONAL_COLS if c in cols_in_file]
-    # must have these minimums, otherwise cannot proceed
     min_required = {"Consequence", "SYMBOL", "Feature", "HGVSp"}
     if not min_required.issubset(cols_in_file):
         missing = sorted(list(min_required - cols_in_file))
@@ -249,7 +249,6 @@ def iter_missense_batches(parquet_path: Path, batch_size: int):
 
     dataset = ds.dataset(str(parquet_path), format="parquet")
 
-    # scan-time filter (fast)
     try:
         filt = pc.match_substring(pc.cast(ds.field("Consequence"), pa.string()), "missense_variant")
     except Exception:
@@ -261,14 +260,12 @@ def iter_missense_batches(parquet_path: Path, batch_size: int):
         table = pa.Table.from_batches([rb])
         df = table.to_pandas(types_mapper=pd.ArrowDtype)
 
-        # safety contains (handles comma-separated)
         mask = df["Consequence"].astype("string").str.contains("missense_variant", case=False, na=False)
         df = df.loc[mask]
         if len(df) == 0:
             continue
 
-        # ensure all expected columns exist (fill missing optional as NA)
-        for c in CORE_COLS + OPTIONAL_COLS:
+        for c in (CORE_COLS + OPTIONAL_COLS):
             if c not in df.columns:
                 df[c] = pd.NA
 
@@ -302,7 +299,8 @@ def process_chrom(chrom: str, input_dir: Path, output_dir: Path, reference_dir: 
 
     total = 0
     verified_true = 0
-    verified_non_na = 0
+    verified_false = 0
+    verified_na = 0
     mane_true = 0
     with_uniprot = 0
 
@@ -312,17 +310,20 @@ def process_chrom(chrom: str, input_dir: Path, output_dir: Path, reference_dir: 
 
         ref_aa, prot_pos, alt_aa = parse_hgvsp_cols(df["HGVSp"])
         df["ref_aa"] = ref_aa
-        df["protein_pos"] = prot_pos
+        df["protein_pos"] = prot_pos.astype("Int64")
         df["alt_aa"] = alt_aa
         df["mutation"] = (
             df["ref_aa"].astype("string")
-            + df["protein_pos"].astype("Int64").astype("string")
+            + df["protein_pos"].astype("string")
             + df["alt_aa"].astype("string")
         )
 
-        df["seq_verified"] = verify_seq_fast(df["Feature"], df["protein_pos"], df["ref_aa"], enst_to_seq)
-        verified_non_na += int(df["seq_verified"].notna().sum())
-        verified_true += int((df["seq_verified"] == True).sum())
+        sv = verify_seq_fast(df["Feature"], df["protein_pos"], df["ref_aa"], enst_to_seq)
+        df["seq_verified_i8"] = seq_verified_to_int8(sv)
+
+        verified_true += int((df["seq_verified_i8"] == 1).sum())
+        verified_false += int((df["seq_verified_i8"] == 0).sum())
+        verified_na += int((df["seq_verified_i8"] == -1).sum())
 
         df["uniprot_id"] = df["SYMBOL"].astype("string").map(gene_to_uniprot)
         df["alphafold_id"] = df["uniprot_id"].apply(lambda x: f"AF-{x}-F1" if pd.notna(x) and x else pd.NA)
@@ -349,8 +350,9 @@ def process_chrom(chrom: str, input_dir: Path, output_dir: Path, reference_dir: 
     stats = {
         "chrom": chrom,
         "total_missense": total,
-        "seq_verified_non_na": verified_non_na,
         "seq_verified_true": verified_true,
+        "seq_verified_false": verified_false,
+        "seq_verified_na": verified_na,
         "mane_select_true": mane_true,
         "with_uniprot": with_uniprot,
         "minutes": round((time.time() - t0) / 60, 2),
@@ -368,7 +370,7 @@ def process_chrom(chrom: str, input_dir: Path, output_dir: Path, reference_dir: 
 # =========================
 def stream_write_dataset(input_files: List[Path], out_path: Path, kind: str, batch_size: int) -> int:
     dataset = ds.dataset([str(p) for p in input_files], format="parquet")
-    f_verified = (ds.field("seq_verified") == True)
+    f_verified = (ds.field("seq_verified_i8") == 1)
     f_mane = (ds.field("is_mane_select") == True)
 
     if kind == "all":
@@ -452,13 +454,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.cmd == "process-chrom":
-        return process_chrom(
-            chrom=args.chrom,
-            input_dir=args.input_dir,
-            output_dir=args.output_dir,
-            reference_dir=args.reference_dir,
-            batch_size=args.batch_size,
-        )
+        return process_chrom(args.chrom, args.input_dir, args.output_dir, args.reference_dir, args.batch_size)
     else:
         return combine(args.output_dir, args.batch_size)
 
