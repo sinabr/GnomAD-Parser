@@ -1,23 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=process_missense
-#SBATCH --partition=model4
+#SBATCH --job-name=missense_gpu
+#SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=128G
-#SBATCH --time=12:00:00
-#SBATCH --output=logs/process_missense_%j.out
-#SBATCH --error=logs/process_missense_%j.err
-
-# ============================================================================
-# Process Chromosome Parquet Files → Validated Missense Variants
-# ============================================================================
-# This script reads the chromosome-level Parquet files and produces
-# validated missense variants with protein sequences.
-#
-# Memory: 64GB is sufficient for loading all chromosome data in batches
-# Time: ~2-3 hours for all chromosomes
-# ============================================================================
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=170G
+#SBATCH --time=10:00:00
+#SBATCH --array=1-24%4
+#SBATCH --output=logs/missense_gpu_%A_%a.out
+#SBATCH --error=logs/missense_gpu_%A_%a.err
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate protein
@@ -27,42 +18,24 @@ set -euo pipefail
 mkdir -p logs
 mkdir -p gnomad_missense_validated
 
-echo "============================================================================"
-echo "GNOMAD MISSENSE VARIANT PROCESSING"
-echo "============================================================================"
-echo "Job ID: $SLURM_JOB_ID"
-echo "Node: $SLURM_NODELIST"
-echo "CPUs: $SLURM_CPUS_PER_TASK"
-echo "Memory: $SLURM_MEM_PER_NODE MB"
-echo "Start Time: $(date)"
-echo "============================================================================"
-echo ""
-
-# Run the processing script
-python -u process_missense_from_parquet.py
-
-EXIT_CODE=$?
-
-echo ""
-echo "============================================================================"
-echo "PROCESSING COMPLETE"
-echo "============================================================================"
-echo "Exit code: $EXIT_CODE"
-echo "End time: $(date)"
-echo ""
-
-if [ $EXIT_CODE -eq 0 ]; then
-    echo "✅ Success! Results saved to gnomad_missense_validated/"
-    echo ""
-    echo "Output files:"
-    ls -lh gnomad_missense_validated/*.parquet 2>/dev/null || echo "  (no parquet files found)"
-    echo ""
-    echo "Statistics:"
-    cat gnomad_missense_validated/statistics.json 2>/dev/null || echo "  (statistics not found)"
+TASK=${SLURM_ARRAY_TASK_ID}
+if   [ "$TASK" -ge 1 ] && [ "$TASK" -le 22 ]; then CHROM="$TASK"
+elif [ "$TASK" -eq 23 ]; then CHROM="X"
+elif [ "$TASK" -eq 24 ]; then CHROM="Y"
 else
-    echo "❌ Processing failed. Check logs/process_missense_${SLURM_JOB_ID}.err for details."
+  echo "Bad SLURM_ARRAY_TASK_ID=$TASK"
+  exit 2
 fi
 
-echo "============================================================================"
+echo "JobID=$SLURM_JOB_ID ArrayJobID=$SLURM_ARRAY_JOB_ID TaskID=$SLURM_ARRAY_TASK_ID"
+echo "Node=$SLURM_NODELIST CPUs=$SLURM_CPUS_PER_TASK MEM=$SLURM_MEM_PER_NODE"
+echo "Chrom=$CHROM Start=$(date)"
 
-exit $EXIT_CODE
+python -u process_all_dataframes.py process-chrom \
+  --chrom "$CHROM" \
+  --input_dir gnomad_all_genes/chromosome_dataframes \
+  --output_dir gnomad_missense_validated \
+  --reference_dir /projects/lugoteam/protein_graphs/GnomAD-Parser/ref_data \
+  --batch_size 500000
+
+echo "Done Chrom=$CHROM End=$(date)"
